@@ -1,0 +1,210 @@
+name: Build Kernel
+on:
+  workflow_dispatch:
+    inputs:
+      select_device:
+        description: 'Select device:'
+        required: true
+        type: choice
+        options:
+        - 'lancelot'
+        - 'merlin'
+        - 'selene'
+
+env:
+  BOARD: mt6768
+  DEVICE: ${{ github.event.inputs.select_device }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+        - name: Checkout
+          uses: actions/checkout@v7
+          with:
+            fetch-depth: 0
+
+        - name: Prepare
+          run: |
+            grep -v -E "^#|^\n" config.env | sed 's/ #.*//; s/#.*//' >> $GITHUB_ENV
+            mkdir -p $GITHUB_WORKSPACE/builder_workspace
+            sudo tee /usr/local/bin/get > /dev/null << 'EOF'
+            #!/bin/bash
+            obj=$(basename "$1")
+            dir="$2"
+            if [[ $1 == *.git ]]; then
+                if [[ -z $3 ]]; then
+                    git clone --recursive "$1" --branch="$2" --depth=1 --single-branch --no-tags
+                else
+                    git clone --recursive "$1" --branch="$2" --depth=1 --single-branch --no-tags "$3"
+                fi
+            else
+                mkdir "$dir"
+                aria2c --file-allocation=none -s $(nproc --all) -x $(nproc --all) -d $PWD -o "$obj" "$1"
+                case "$obj" in
+                    *.tar.gz | *.tgz)
+                        tar -C "$dir" -zxvf "$obj"
+                        ;;
+                    *.tar.xz | *.txz)
+                        tar -C "$dir" -Jxvf "$obj"
+                        ;;
+                    *.tar.zst)
+                        tar -C "$dir" -I zstd -xf "$obj"
+                        ;;
+                    *.zip | *.jar)
+                        unzip "$obj" -d "$dir"
+                        ;;
+                    *)
+                        echo "get: unsupported url: $1"
+                        exit 1
+                        ;;
+                esac
+                rm "$obj"
+                if [[ "$(find "$dir" -mindepth 1 -maxdepth 1 -type d | wc -l)" == "1" ]]; then
+                    mv -f "$(find "$dir" -mindepth 1 -maxdepth 1 -type d)"/* "$dir"
+                fi
+            fi
+            EOF
+            sudo chmod +x /usr/local/bin/get
+            sudo rm -rf /usr/share/dotnet # 5.6G
+
+        - name: Install some packages
+          if: env.NEED_SOME_PACKAGES == 'true'
+          run: |
+            sudo apt-get update
+            sudo apt-get install -y build-essential
+
+        - name: Install python2
+          if: env.NEED_PYTHON2 == 'true'
+          run: |
+            mkdir -p ~/python2-jammy && cd ~/python2-jammy
+            wget http://security.ubuntu.com/ubuntu/pool/universe/p/python2.7/python2.7_2.7.18-13ubuntu1.5_amd64.deb
+            wget http://security.ubuntu.com/ubuntu/pool/universe/p/python2.7/libpython2.7-stdlib_2.7.18-13ubuntu1.5_amd64.deb
+            wget http://security.ubuntu.com/ubuntu/pool/universe/p/python2.7/python2.7-minimal_2.7.18-13ubuntu1.5_amd64.deb
+            wget http://security.ubuntu.com/ubuntu/pool/universe/p/python2.7/libpython2.7-minimal_2.7.18-13ubuntu1.5_amd64.deb
+            sudo apt install libnsl2 -y
+            sudo dpkg -i libpython2.7-minimal_*.deb
+            sudo dpkg -i python2.7-minimal_*.deb
+            sudo dpkg -i libpython2.7-stdlib_*.deb
+            sudo dpkg -i python2.7_*.deb
+            sudo apt --fix-broken install
+            sudo ln -s /usr/bin/python2.7 /usr/local/bin/python2
+            rm -rf ~/python2-jammy
+
+        - name: Download Clang
+          if: env.CC_CLANG_ENABLE == 'true'
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace
+            get $CC_CLANG_SOURCE $CC_CLANG_BRANCH clang
+
+        - name: Download kernel source
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace
+            get $KERNEL_SOURCE $KERNEL_SOURCE_BRANCH kernel_src
+
+        - name: Setup KernelSU
+          if: env.KERNELSU_ENABLE == 'true'
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace/kernel_src
+            curl -LSs "$KERNELSU_SETUP_SOURCE" | bash -s $KERNELSU_TAG
+            KSU_VERSION="_$(cd $(echo "$KERNELSU_SETUP_SOURCE" | cut -d/ -f5) || cd KernelSU && expr $(git rev-list --count HEAD) + 10200)"
+            echo "PREFIX=-$(echo "$KERNELSU_SETUP_SOURCE" | cut -d/ -f5)$KSU_VERSION" >> $GITHUB_ENV
+            if [[ "$KERNELSU_REVERT_GKI" == "true" ]]; then
+                git apply $GITHUB_WORKSPACE/patches/KERNELSU_REVERT_GKI.patch
+            fi
+
+        - name: Configure kernel
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace/kernel_src
+            overrides=()
+            if [[ "$APATCH_ENABLE" == "true" ]]; then
+                overrides+=(
+                    "CONFIG_DEBUG_KERNEL=y"
+                    "CONFIG_KALLSYMS=y"
+                    "CONFIG_KALLSYMS_ALL=y"
+                    "CONFIG_KALLSYMS_BASE_RELATIVE=y"
+                )
+            fi
+            if [[ "$KERNEL_CONFIG_MONOLITHIC" == "true" ]]; then
+                base_config="arch/$KERNEL_ARCH/configs/${DEVICE}_defconfig"
+                used_configs=(
+                    "$base_config"
+                )
+            else
+                base_config="arch/$KERNEL_ARCH/configs/vendor/${BOARD}_defconfig"
+                device_config="arch/$KERNEL_ARCH/configs/vendor/${DEVICE}.config"
+                used_configs=(
+                    "$base_config"
+                    "$device_config"
+                )
+            fi
+            for config in "${used_configs[@]}"; do
+                for override in "${overrides[@]}"; do
+                    target="${override%%=*}"
+                    sed -i -E "/^[[:space:]]*#?[[:space:]]*${target}([[:space:]]*=|[[:space:]]|$)/d" $config
+                done
+            done
+            for override in "${overrides[@]}"; do
+                echo $override >> $base_config
+            done
+
+        - name: Set swap to 8G
+          uses: pierotofy/set-swap-space@master
+          with:
+            swap-size-gb: 8
+
+        - name: Build kernel
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace/kernel_src
+            if [[ "$CC_CLANG_ENABLE" == "true" ]]; then
+                export PATH=$GITHUB_WORKSPACE/builder_workspace/clang/bin:$PATH
+            else
+                echo "Toolchain not selected"
+                exit 1
+            fi
+            export KBUILD_BUILD_HOST=Github-Action
+            export KBUILD_BUILD_USER=$GITHUB_REPOSITORY_OWNER
+            if [[ "$KERNELSU_ENABLE" == true ]] && [[ -n "$KERNELSU_EXPECTED_SIZE" ]] && [[ -n "$KERNELSU_EXPECTED_HASH" ]]; then
+                export KSU_EXPECTED_SIZE=$KERNELSU_EXPECTED_SIZE
+                export KSU_EXPECTED_HASH=$KERNELSU_EXPECTED_HASH
+            fi
+            mkdir -p out
+            if [[ "$KERNEL_CONFIG_MONOLITHIC" == "true" ]]; then
+                make O=out ARCH=$KERNEL_ARCH CC=clang $CC_CMDS ${DEVICE}_defconfig
+            else
+                ./scripts/kconfig/merge_config.sh -m -O out "arch/$KERNEL_ARCH/configs/vendor/${BOARD}_defconfig" "arch/$KERNEL_ARCH/configs/vendor/${DEVICE}.config"
+                make O=out ARCH=$KERNEL_ARCH CC=clang $CC_CMDS olddefconfig
+            fi
+            make -j$(nproc --all) O=out ARCH=$KERNEL_ARCH CC=clang $CC_CMDS
+
+        - name: Check output files
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace
+            if [[ -f kernel_src/out/arch/$KERNEL_ARCH/boot/$KERNEL_IMAGE_NAME ]]; then
+                echo "CHECK_FILE_IS_OK=true" >> $GITHUB_ENV
+            else
+                echo "Kernel output file is empty"
+                exit 1
+            fi
+
+        - name: Create AnyKernel3 archive
+          if: env.CHECK_FILE_IS_OK == 'true' && env.ANYKERNEL3_ENABLE == 'true'
+          run: |
+            cd $GITHUB_WORKSPACE/builder_workspace
+            get $ANYKERNEL3_SOURCE $ANYKERNEL3_BRANCH AnyKernel3
+            cp kernel_src/out/arch/$KERNEL_ARCH/boot/$KERNEL_IMAGE_NAME AnyKernel3/
+            rm -rf AnyKernel3/.git* AnyKernel3/README.md
+
+        - name: Upload AnyKernel3 archive
+          if: env.CHECK_FILE_IS_OK == 'true' && env.ANYKERNEL3_ENABLE == 'true'
+          uses: actions/upload-artifact@v6
+          with:
+            name: AnyKernel3-${{ env.DEVICE }}${{ env.PREFIX }}-${{ github.run_number }}
+            path: builder_workspace/AnyKernel3/*
+
+        - name: Upload kernel_src image
+          if: env.CHECK_FILE_IS_OK == 'true'
+          uses: actions/upload-artifact@v6
+          with:
+            name: ${{ env.KERNEL_IMAGE_NAME }}
+            path: builder_workspace/kernel_src/out/arch/${{ env.KERNEL_ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
