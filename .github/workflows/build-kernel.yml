@@ -202,6 +202,7 @@ jobs:
                     "CONFIG_NF_NAT_IPV6=y"
                     "CONFIG_MACVLAN=y"
                     "CONFIG_USER_NS=y"
+                    "CONFIG_BINFMT_MISC=y"
                 )
             fi
             for config in "${used_configs[@]}"; do
