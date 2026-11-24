@@ -116,6 +116,12 @@
 
 <br>
 
+| Droidspaces section options | Optional | Description | Example value |
+|-----------------------|----------|-------------|---------------|
+| DROIDSPACES_ENABLE | <div align="center">✅</div> | Add [required configs](https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Kernel-Configuration.md#step-1-the-required-options) and a [patch](https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/resources/kernel-patches/non-GKI/02.fix_restore%20cgroup%20file%20prefix%20handling%20.patch) for [Droidspaces](https://github.com/ravindu644/Droidspaces-OSS) | <div align="center">`false`</div> |
+
+<br>
+
 ## Credits
 
 - [dabao1955](https://github.com/dabao1955) for the structure of README.md
